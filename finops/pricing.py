@@ -6,6 +6,19 @@ live prices as fast-moving (re-baseline before each cohort).
 from __future__ import annotations
 
 
+# Illustrative per-hour interruption probabilities. Keep these as replaceable
+# data so a FinOps team can substitute its provider's observed interruption feed.
+SPOT_INTERRUPTION_RATES = {
+    "H100": 0.03,
+    "H200": 0.04,
+    "A100": 0.05,
+    "A10G": 0.10,
+    "L4": 0.08,
+    "B200": 0.06,
+    "MI300X": 0.05,
+}
+
+
 def request_cost(
     input_tok: int,
     output_tok: int,
@@ -60,21 +73,75 @@ def break_even_utilization(discount_frac: float) -> float:
     return max(0.0, min(1.0, 1.0 - discount_frac))
 
 
-def recommend_tier(hours_per_day: float, interruptible: bool, reserved_discount: float = 0.45) -> str:
+def recommend_tier(
+    hours_per_day: float,
+    interruptible: bool,
+    reserved_discount: float = 0.45,
+    gpu_type: str | None = None,
+    job_days: float | None = None,
+    return_details: bool = False,
+) -> str | dict:
     """Pick a purchasing tier from a workload's duty cycle + interruptibility.
 
-    DOCUMENTED simple policy (instructor extension point — swap in your own):
-      - interruptible & not 24/7  -> 'spot'      (checkpoint and ride the discount)
-      - duty cycle >= break-even  -> 'reserved'  (steady, high utilization)
-      - otherwise                 -> 'on_demand' (spiky / low duty)
+    The default return remains a backward-compatible tier string. Optional GPU
+    type and duration inputs add risk/term evidence; ``return_details=True``
+    exposes those assumptions for audit and reporting.
     """
     duty = max(0.0, hours_per_day) / 24.0
     be = break_even_utilization(reserved_discount)
-    if interruptible and hours_per_day < 24:
-        return "spot"
-    if duty >= be:
-        return "reserved"
-    return "on_demand"
+    interruption_rate = SPOT_INTERRUPTION_RATES.get(gpu_type or "", 0.05)
+    # Expected rework of 0.5 h/interruption plus 3% checkpoint overhead.
+    spot_overhead = 0.03 + interruption_rate * 0.5
+    if interruptible and hours_per_day < 24 and spot_overhead <= 0.15:
+        tier = "spot"
+        term = None
+        reason = (
+            f"checkpointable; {interruption_rate:.0%}/h interruption assumption "
+            f"adds about {spot_overhead:.1%} compute overhead"
+        )
+    elif duty >= be:
+        tier = "reserved"
+        term = "3yr" if job_days is not None and job_days >= 730 else "1yr"
+        reason = (
+            f"{duty:.0%} duty cycle clears the {be:.0%} break-even; "
+            f"{term} matches the stated planning horizon"
+        )
+    else:
+        tier = "on_demand"
+        term = None
+        reason = f"{duty:.0%} duty cycle is below the {be:.0%} commitment break-even"
+
+    if return_details:
+        return {
+            "tier": tier,
+            "reserved_term": term,
+            "interruption_rate": interruption_rate,
+            "spot_overhead_frac": spot_overhead,
+            "reason": reason,
+        }
+    return tier
+
+
+def cache_break_even_reads(write_cost_per_m: float, read_discount: float = 0.10) -> float:
+    """Reads needed for saved input charges to repay one cache write.
+
+    ``write_cost_per_m`` is relative to the normal input price: 1.25 means a
+    cache write costs 1.25 times a normal input read.
+    """
+    if write_cost_per_m < 0:
+        raise ValueError("write_cost_per_m must be non-negative")
+    if not 0 <= read_discount < 1:
+        raise ValueError("read_discount must be in [0, 1)")
+    return write_cost_per_m / (1.0 - read_discount)
+
+
+def cache_is_worth_it(
+    avg_cache_reads: float,
+    write_cost_per_m: float,
+    read_discount: float = 0.10,
+) -> bool:
+    """Return whether expected prefix reuse clears cache-write break-even."""
+    return avg_cache_reads >= cache_break_even_reads(write_cost_per_m, read_discount)
 
 
 def spot_checkpoint_cost(

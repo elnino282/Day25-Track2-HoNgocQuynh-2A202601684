@@ -5,3 +5,6 @@ __pycache__/
 venv/
 outputs/*
 !outputs/.gitkeep
+!outputs/report.md
+!outputs/savings.png
+!outputs/focus_export.csv
